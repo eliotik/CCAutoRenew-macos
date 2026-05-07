@@ -32,8 +32,39 @@ parse_time_remaining() {
         return 1
     fi
     
-    # Try to get blocks info and extract time remaining
-    local output=$($ccusage_cmd blocks 2>/dev/null | grep -i "time remaining" | head -1)
+    # Method 1: Use jq if available for better precision
+    if command -v jq &> /dev/null; then
+        # Try to get active block info in JSON format
+        local json_output=$($ccusage_cmd blocks -a -j 2>/dev/null)
+        if [ -n "$json_output" ] && [ "$json_output" != "null" ]; then
+            # Priority 1: Time until block endTime (actual reset window)
+            local end_time=$(echo "$json_output" | jq -r '.blocks[0].endTime // empty' 2>/dev/null)
+            if [ -n "$end_time" ] && [ "$end_time" != "null" ]; then
+                local current_ts=$(date +%s)
+                # Parse ISO date (works on macOS and Linux)
+                local end_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$end_time" +%s 2>/dev/null || \
+                              date -j -f "%Y-%m-%dT%H:%M:%S.000Z" "$end_time" +%s 2>/dev/null || \
+                              date -d "$end_time" +%s 2>/dev/null)
+                
+                if [ -n "$end_ts" ]; then
+                    local diff=$(( (end_ts - current_ts) / 60 ))
+                    if [ $diff -ge 0 ]; then
+                        echo "$diff"
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    # Method 2: Fallback to regex on text output
+    # Try active block first
+    local output=$($ccusage_cmd blocks -a 2>/dev/null | grep -i "remaining" | head -1)
+    
+    if [ -z "$output" ]; then
+        # Try to get blocks info and extract time remaining
+        output=$($ccusage_cmd blocks 2>/dev/null | grep -i "time remaining" | head -1)
+    fi
     
     if [ -z "$output" ]; then
         # Try live mode for more accurate info
@@ -118,7 +149,7 @@ start_claude_session() {
     cat > /tmp/claude_auto_start.exp << 'EOF'
 #!/usr/bin/expect -f
 set timeout 10
-spawn claude
+spawn claude --dangerously-skip-permissions
 expect {
     ">" {
         send "hi\r"
@@ -141,7 +172,7 @@ EOF
         local result=$?
     else
         # Fallback to simple echo with macOS-compatible timeout
-        (echo "hi" | claude >> "$LOG_FILE" 2>&1) &
+        (echo "hi" | claude --dangerously-skip-permissions >> "$LOG_FILE" 2>&1) &
         local pid=$!
         
         # Wait up to 10 seconds

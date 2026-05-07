@@ -8,6 +8,9 @@ LOG_FILE="$HOME/.claude-auto-renew-daemon.log"
 START_TIME_FILE="$HOME/.claude-auto-renew-start-time"
 STOP_TIME_FILE="$HOME/.claude-auto-renew-stop-time"
 MESSAGE_FILE="$HOME/.claude-auto-renew-message"
+DIR_FILE="$HOME/.claude-auto-renew-dir"
+SESSION_FILE="$HOME/.claude-auto-renew-session"
+CONTINUE_FILE="$HOME/.claude-auto-renew-continue"
 
 # Colors for output
 RED='\033[0;31m'
@@ -28,21 +31,28 @@ print_warning() {
 }
 
 start_daemon() {
-    # Parse --at and --stop parameters
+    # Parse parameters
     START_TIME=""
     STOP_TIME=""
     DISABLE_CCUSAGE=false
     CUSTOM_MESSAGE=""
+    TARGET_DIR=""
+    SESSION_ID=""
+    CONTINUE_SESSION=false
     
     # Parse parameters
-    while [[ $# -gt 1 ]]; do
-        case $2 in
+    while [[ $# -gt 0 ]]; do
+        case $1 in
             --at)
-                START_TIME="$3"
+                # Strip quotes if present
+                START_TIME="${2%\"}"
+                START_TIME="${START_TIME#\"}"
                 shift 2
                 ;;
             --stop)
-                STOP_TIME="$3"
+                # Strip quotes if present
+                STOP_TIME="${2%\"}"
+                STOP_TIME="${STOP_TIME#\"}"
                 shift 2
                 ;;
             --disableccusage)
@@ -50,8 +60,28 @@ start_daemon() {
                 shift
                 ;;
             --message)
-                CUSTOM_MESSAGE="$3"
+                # Strip quotes if present
+                CUSTOM_MESSAGE="${2%\"}"
+                CUSTOM_MESSAGE="${CUSTOM_MESSAGE#\"}"
                 shift 2
+                ;;
+            --dir)
+                TARGET_DIR="$2"
+                # Expand ~ if present
+                if [[ "$TARGET_DIR" == "~"* ]]; then
+                    TARGET_DIR="${HOME}${TARGET_DIR:1}"
+                fi
+                shift 2
+                ;;
+            --session)
+                # Strip quotes if present
+                SESSION_ID="${2%\"}"
+                SESSION_ID="${SESSION_ID#\"}"
+                shift 2
+                ;;
+            --continue)
+                CONTINUE_SESSION=true
+                shift
                 ;;
             *)
                 shift
@@ -121,6 +151,36 @@ start_daemon() {
     else
         # Remove any existing custom message (use default messages)
         rm -f "$MESSAGE_FILE" 2>/dev/null
+    fi
+
+    # Process target directory
+    if [ -n "$TARGET_DIR" ]; then
+        # Resolve path (handle ~)
+        TARGET_DIR="${TARGET_DIR/#\~/$HOME}"
+        if [ ! -d "$TARGET_DIR" ]; then
+            print_error "Directory does not exist: $TARGET_DIR"
+            return 1
+        fi
+        echo "$TARGET_DIR" > "$DIR_FILE"
+        print_status "Renewals will happen in directory: $TARGET_DIR"
+    else
+        rm -f "$DIR_FILE" 2>/dev/null
+    fi
+
+    # Process session ID
+    if [ -n "$SESSION_ID" ]; then
+        echo "$SESSION_ID" > "$SESSION_FILE"
+        print_status "Renewals will resume session: $SESSION_ID"
+    else
+        rm -f "$SESSION_FILE" 2>/dev/null
+    fi
+
+    # Process continue flag
+    if [ "$CONTINUE_SESSION" = true ]; then
+        touch "$CONTINUE_FILE"
+        print_status "Renewals will use --continue flag"
+    else
+        rm -f "$CONTINUE_FILE" 2>/dev/null
     fi
     
     if [ -f "$PID_FILE" ]; then
@@ -605,10 +665,14 @@ case "$1" in
         echo "  start --at TIME --stop END - Start monitoring at TIME, stop at END"
         echo "  start --disableccusage     - Start daemon without ccusage (clock-based only)"
         echo "  start --message \"text\"     - Use custom message for renewal instead of random greetings"
+        echo "  start --dir PATH           - Run renewals in specified directory (for project-specific sessions)"
+        echo "  start --session ID         - Resume specific session ID during renewal"
+        echo "  start --continue           - Use --continue flag during renewal to resume last session"
         echo "                               Examples: --at '09:00' --stop '17:00'"
         echo "                                        --at '2025-01-28 09:00' --stop '2025-01-28 17:00'"
         echo "                                        --at '09:00' --stop '17:00' --disableccusage"
         echo "                                        --message 'continue working on the React feature'"
+        echo "                                        --dir '~/my-project' --continue"
         echo "  stop                       - Stop the daemon"
         echo "  restart                    - Restart the daemon"
         echo "  status                     - Show daemon status"

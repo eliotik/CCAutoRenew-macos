@@ -26,6 +26,7 @@ Claude Code operates on a 5-hour subscription model that renews from your first 
 - 🎯 **Intelligent Scheduling** - Checks more frequently as renewal approaches
 - 📝 **Detailed Logging** - Track all renewal activities with WAITING/ACTIVE/STOPPED states
 - 📊 **Live Dashboard** - Real-time monitoring with progress bars and renewal schedules
+- 🖥️ **Tmux Integration** - Monitor renewals in real-time by attaching to the `claude-renewal` tmux session
 - 💬 **Custom Messages** - Use `--message` to send contextual renewal messages instead of generic greetings
 - 🛡️ **Failsafe Design** - Multiple fallback mechanisms and prevents renewals near stop time
 - 🖥️ **Cross-platform** - Works on macOS and Linux
@@ -148,6 +149,23 @@ The new live dashboard provides real-time monitoring of your Claude renewal stat
 # Launch the interactive dashboard
 ./claude-daemon-manager.sh dash
 ```
+
+### Monitoring via Tmux 🖥️
+
+The daemon now executes Claude renewals inside a dedicated `tmux` session. This allows you to see exactly what Claude is doing during the renewal process.
+
+```bash
+# Attach to the renewal session to see live output
+tmux attach -t claude-renewal
+```
+
+**Tmux Features:**
+- 🔍 **Real-time visibility** - See the actual Claude CLI interaction
+- 📂 **Session persistent** - The window stays open for 60 seconds after renewal completes
+- 🛡️ **Safe execution** - Previous sessions are automatically cleaned up
+- 🔄 **Auto-fallback** - If `tmux` isn't installed, it safely falls back to standard background execution
+
+This is particularly useful when using `--message` to verify that your context is being correctly passed to the new session.
 
 **Dashboard Features:**
 - 🔧 **Daemon Status** - Current state (WAITING/ACTIVE/STOPPED) with PID and timing details

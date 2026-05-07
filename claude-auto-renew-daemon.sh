@@ -9,11 +9,15 @@ LAST_ACTIVITY_FILE="$HOME/.claude-last-activity"
 START_TIME_FILE="$HOME/.claude-auto-renew-start-time"
 STOP_TIME_FILE="$HOME/.claude-auto-renew-stop-time"
 MESSAGE_FILE="$HOME/.claude-auto-renew-message"
+DIR_FILE="$HOME/.claude-auto-renew-dir"
+SESSION_FILE="$HOME/.claude-auto-renew-session"
+CONTINUE_FILE="$HOME/.claude-auto-renew-continue"
 DISABLE_CCUSAGE=false
 
 # Function to log messages
 log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    # Send to log file and also to stderr (so it's not captured by $(...) blocks)
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE" >&2
 }
 
 # Function to handle shutdown
@@ -158,7 +162,48 @@ get_minutes_until_reset() {
     fi
     
     # Try to get time remaining from ccusage
-    local output=$($ccusage_cmd blocks 2>/dev/null | grep -i "time remaining" | head -1)
+    local output=""
+    
+    # Method 1: Use jq if available for better precision
+    if command -v jq &> /dev/null; then
+        # Try to get active block info in JSON format
+        local json_output=$($ccusage_cmd blocks -a -j 2>/dev/null)
+        if [ -n "$json_output" ] && [ "$json_output" != "null" ]; then
+            # Priority 1: Time until block endTime (actual reset window)
+            local end_time=$(echo "$json_output" | jq -r '.blocks[0].endTime // empty' 2>/dev/null)
+            if [ -n "$end_time" ] && [ "$end_time" != "null" ]; then
+                local current_ts=$(date +%s)
+                # Parse ISO date (works on macOS and Linux)
+                local end_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$end_time" +%s 2>/dev/null || \
+                              date -j -f "%Y-%m-%dT%H:%M:%S.000Z" "$end_time" +%s 2>/dev/null || \
+                              date -d "$end_time" +%s 2>/dev/null)
+                
+                if [ -n "$end_ts" ]; then
+                    local diff=$(( (end_ts - current_ts) / 60 ))
+                    if [ $diff -ge 0 ]; then
+                        echo "$diff"
+                        return 0
+                    fi
+                fi
+            fi
+            
+            # Priority 2: Projection remaining minutes (time until limit hit)
+            local proj_rem=$(echo "$json_output" | jq -r '.blocks[0].projection.remainingMinutes // empty' 2>/dev/null)
+            if [ -n "$proj_rem" ] && [ "$proj_rem" != "null" ] && [ "$proj_rem" != "0" ]; then
+                echo "$proj_rem"
+                return 0
+            fi
+        fi
+    fi
+    
+    # Method 2: Fallback to regex on text output
+    # Try active block first
+    output=$($ccusage_cmd blocks -a 2>/dev/null | grep -i "remaining" | head -1)
+    
+    # Fallback to general blocks if active fails
+    if [ -z "$output" ]; then
+        output=$($ccusage_cmd blocks 2>/dev/null | grep -i "time remaining" | head -1)
+    fi
     
     if [ -z "$output" ]; then
         output=$($ccusage_cmd blocks --live 2>/dev/null | grep -i "remaining" | head -1)
@@ -193,6 +238,9 @@ start_claude_session() {
     if [ -f "$MESSAGE_FILE" ]; then
         # Use custom message
         selected_message=$(cat "$MESSAGE_FILE")
+        # Strip quotes if they somehow got into the file
+        selected_message="${selected_message%\"}"
+        selected_message="${selected_message#\"}"
         log_message "Using custom message: \"$selected_message\""
     else
         # Define an array of predefined messages
@@ -202,55 +250,113 @@ start_claude_session() {
         local random_index=$((RANDOM % ${#messages[@]}))
         selected_message="${messages[$random_index]}"
     fi
+
+    # Build claude command arguments as an array
+    local claude_args=("--dangerously-skip-permissions")
     
-    # Simple approach - macOS compatible
-    # Use a subshell with background process for timeout
-    (echo "$selected_message" | claude >> "$LOG_FILE" 2>&1) &
-    local pid=$!
-    
-    # Wait up to 10 seconds
-    local count=0
-    while kill -0 $pid 2>/dev/null && [ $count -lt 10 ]; do
-        sleep 1
-        ((count++))
-    done
-    
-    # Kill if still running
-    if kill -0 $pid 2>/dev/null; then
-        kill $pid 2>/dev/null
-        wait $pid 2>/dev/null
-        local result=124  # timeout exit code
-    else
-        wait $pid
-        local result=$?
+    # Add session resume parameters
+    if [ -f "$SESSION_FILE" ]; then
+        local session_id=$(cat "$SESSION_FILE")
+        # Strip quotes to avoid double-quoting issues
+        session_id="${session_id%\"}"
+        session_id="${session_id#\"}"
+        claude_args+=("--resume" "$session_id")
+        log_message "Resuming session: $session_id"
+    elif [ -f "$CONTINUE_FILE" ]; then
+        claude_args+=("--continue")
+        log_message "Using --continue flag"
+    fi
+
+    # Determine execution directory
+    local exec_dir="."
+    if [ -f "$DIR_FILE" ]; then
+        exec_dir=$(cat "$DIR_FILE")
+        # Expand ~ if present
+        if [[ "$exec_dir" == "~"* ]]; then
+            exec_dir="${HOME}${exec_dir:1}"
+        fi
+        if [ -d "$exec_dir" ]; then
+            log_message "Executing renewal in directory: $exec_dir"
+        else
+            log_message "WARNING: Configured directory $exec_dir does not exist, using current directory"
+            exec_dir="."
+        fi
     fi
     
-    if [ $result -eq 0 ] || [ $result -eq 124 ]; then  # 124 is timeout exit code
-        log_message "Claude session started successfully with message: $selected_message"
+    # Check for tmux
+    local use_tmux=false
+    if command -v tmux &> /dev/null; then
+        use_tmux=true
+    fi
+
+    if [ "$use_tmux" = true ]; then
+        log_message "Executing via tmux session 'claude-renewal'..."
+        # Kill existing renewal session if it exists
+        tmux kill-session -t claude-renewal 2>/dev/null
+        
+        # Start new session in tmux
+        # We use tee to capture output to log file and also show it in tmux
+        # We add a sleep/read at the end so the user can see what happened if they attach
+        tmux new-session -d -s claude-renewal -c "$exec_dir" \
+            "echo \"$selected_message\" | claude ${claude_args[@]} 2>&1 | tee -a \"$LOG_FILE\"; \
+             echo -e \"\n--- Renewal finished at \$(date) ---\"; \
+             echo \"You can attach to this session next time to see the status.\"; \
+             sleep 60"
+        
+        # We'll consider it successful if we could start the tmux session
+        # The daemon will still log "Renewal successful!"
         date +%s > "$LAST_ACTIVITY_FILE"
         return 0
     else
-        log_message "ERROR: Failed to start Claude session"
-        return 1
+        # Fallback to subshell if no tmux (with corrected argument passing)
+        (cd "$exec_dir" && echo "$selected_message" | claude "${claude_args[@]}" >> "$LOG_FILE" 2>&1) &
+        local pid=$!
+        
+        # Wait up to 15 seconds
+        local count=0
+        while kill -0 $pid 2>/dev/null && [ $count -lt 15 ]; do
+            sleep 1
+            ((count++))
+        done
+        
+        # Kill if still running
+        if kill -0 $pid 2>/dev/null; then
+            kill $pid 2>/dev/null
+            wait $pid 2>/dev/null
+            local result=124  # timeout exit code
+        else
+            wait $pid
+            local result=$?
+        fi
+        
+        if [ $result -eq 0 ] || [ $result -eq 124 ]; then
+            log_message "Claude session started successfully"
+            date +%s > "$LAST_ACTIVITY_FILE"
+            return 0
+        else
+            log_message "ERROR: Failed to start Claude session (Exit code: $result)"
+            return 1
+        fi
     fi
 }
 
 # Function to calculate next check time
 calculate_sleep_duration() {
     local minutes_remaining=$(get_minutes_until_reset)
+    local sleep_time=300 # Default 5 minutes
     
     if [ -n "$minutes_remaining" ] && [ "$minutes_remaining" -gt 0 ]; then
         log_message "Time remaining: $minutes_remaining minutes"
         
         if [ "$minutes_remaining" -le 5 ]; then
             # Check every 30 seconds when close to reset
-            echo 30
+            sleep_time=30
         elif [ "$minutes_remaining" -le 30 ]; then
             # Check every 2 minutes when within 30 minutes
-            echo 120
+            sleep_time=120
         else
             # Check every 10 minutes otherwise
-            echo 600
+            sleep_time=600
         fi
     else
         # Fallback: check based on last activity
@@ -261,17 +367,19 @@ calculate_sleep_duration() {
             local remaining=$((18000 - time_diff))  # 5 hours = 18000 seconds
             
             if [ "$remaining" -le 300 ]; then  # 5 minutes
-                echo 30
+                sleep_time=30
             elif [ "$remaining" -le 1800 ]; then  # 30 minutes
-                echo 120
+                sleep_time=120
             else
-                echo 600
+                sleep_time=600
             fi
         else
             # No info available, check every 5 minutes
-            echo 300
+            sleep_time=300
         fi
     fi
+    
+    echo "$sleep_time"
 }
 
 # Main daemon loop
@@ -468,7 +576,13 @@ main() {
         
         # Calculate how long to sleep
         sleep_duration=$(calculate_sleep_duration)
-        log_message "Next check in $((sleep_duration / 60)) minutes"
+        
+        # Log wait time in minutes (round up)
+        if [ "$sleep_duration" -ge 60 ]; then
+            log_message "Next check in $((sleep_duration / 60)) minutes"
+        else
+            log_message "Next check in $sleep_duration seconds"
+        fi
         
         # Sleep until next check
         sleep "$sleep_duration"

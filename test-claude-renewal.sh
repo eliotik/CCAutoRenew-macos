@@ -90,7 +90,7 @@ test_dependencies() {
         print_pass "Claude CLI available"
         
         # Test claude command works
-        if echo "test" | timeout 5s claude --help &> /dev/null; then
+        if echo "test" | timeout 5s claude --dangerously-skip-permissions --help &> /dev/null; then
             print_pass "Claude CLI responds to help command"
         else
             print_warning "Claude CLI doesn't respond to help (may need authentication)"
