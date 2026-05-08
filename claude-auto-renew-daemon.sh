@@ -32,7 +32,7 @@ trap cleanup SIGTERM SIGINT
 
 # Function to check if we're in the active monitoring window
 is_monitoring_active() {
-    local current_epoch=$(date +%s)
+    local current_epoch="${1:-$(date +%s)}"
     local start_epoch=""
     local stop_epoch=""
     
@@ -68,11 +68,12 @@ is_monitoring_active() {
 
 # Function to check if we should schedule next day restart
 should_restart_tomorrow() {
+    local current_epoch="${1:-$(date +%s)}"
+    
     if [ ! -f "$START_TIME_FILE" ] || [ ! -f "$STOP_TIME_FILE" ]; then
         return 1  # No scheduling needed
     fi
     
-    local current_epoch=$(date +%s)
     local stop_epoch=$(cat "$STOP_TIME_FILE")
     
     # Check if we've passed stop time
@@ -120,13 +121,14 @@ schedule_next_day_restart() {
 
 # Function to get time until start
 get_time_until_start() {
+    local current_epoch="${1:-$(date +%s)}"
+    
     if [ ! -f "$START_TIME_FILE" ]; then
         echo "0"
         return
     fi
     
     local start_epoch=$(cat "$START_TIME_FILE")
-    local current_epoch=$(date +%s)
     local diff=$((start_epoch - current_epoch))
     
     if [ "$diff" -le 0 ]; then
@@ -441,14 +443,18 @@ main() {
     
     # Main loop
     while true; do
+        # Get current timestamp for this iteration
+        local now=$(date +%s)
+        
         # Check if we should schedule next day restart first
-        if should_restart_tomorrow; then
+        if should_restart_tomorrow "$now"; then
             log_message "🛑 Stop time reached. Scheduling restart for tomorrow..."
             schedule_next_day_restart
             
             # Wait for tomorrow's start time
-            while ! is_monitoring_active; do
-                time_until_start=$(get_time_until_start)
+            while ! is_monitoring_active "$(date +%s)"; do
+                local current_now=$(date +%s)
+                time_until_start=$(get_time_until_start "$current_now")
                 hours=$((time_until_start / 3600))
                 minutes=$(((time_until_start % 3600) / 60))
                 
@@ -466,10 +472,10 @@ main() {
         fi
         
         # Check if we're in monitoring window
-        if ! is_monitoring_active; then
+        if ! is_monitoring_active "$now"; then
             # Calculate time until start or reason for inactivity
             if [ -f "$START_TIME_FILE" ]; then
-                time_until_start=$(get_time_until_start)
+                time_until_start=$(get_time_until_start "$now")
                 hours=$((time_until_start / 3600))
                 minutes=$(((time_until_start % 3600) / 60))
                 seconds=$((time_until_start % 60))
@@ -490,13 +496,25 @@ main() {
                         sleep 2    # Check every 2 seconds when imminent
                     fi
                 else
-                    # Past stop time, waiting for tomorrow
-                    log_message "🛑 Past stop time, waiting for tomorrow..."
+                    # Not before start time, but not active - must be past stop time
+                    if [ -f "$STOP_TIME_FILE" ]; then
+                        log_message "🛑 Past stop time, waiting for tomorrow..."
+                    else
+                        # This should theoretically not happen if is_monitoring_active is consistent
+                        # but if it does, just log and sleep briefly to retry
+                        log_message "⚠️  Monitoring inactive (checking again in 1m)..."
+                        sleep 60
+                        continue
+                    fi
                     sleep 300
                 fi
             else
                 # No start time but inactive - must be past stop time
-                log_message "🛑 Past stop time, no restart scheduled..."
+                if [ -f "$STOP_TIME_FILE" ]; then
+                    log_message "🛑 Past stop time, no restart scheduled..."
+                else
+                    log_message "⚠️  Monitoring inactive, no schedule set..."
+                fi
                 sleep 300
             fi
             continue
